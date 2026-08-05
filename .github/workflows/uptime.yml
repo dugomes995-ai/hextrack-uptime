@@ -1,0 +1,98 @@
+name: Checagem externa de uptime
+
+# Vigia o HexTrack DE FORA da Hostinger.
+#
+# Por que existe: o watchdog que roda dentro da VPS cobre "a VPS está viva mas o
+# HexTrack caiu" (o incidente de 04/08/2026). Ele não cobre a VPS inteira morrer —
+# aí ninguém roda o cron e o silêncio é total. Este workflow roda na infra do
+# GitHub, então sobrevive à VPS inteira sumir.
+#
+# Repo público de propósito: Actions em repo público tem minuto ilimitado, e este
+# workflow NÃO usa nenhum segredo. O alerta sai como issue, e o GitHub notifica o
+# dono por e-mail. Nada de credencial num repo aberto.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sondar
+        id: probe
+        run: |
+          set -uo pipefail
+          probe() {  # url, http esperado
+            for i in 1 2 3; do
+              got="$(curl -s -o /tmp/body -w '%{http_code}' --max-time 15 "$1" || echo erro)"
+              [ "$got" = "$2" ] && return 0
+              [ "$i" -lt 3 ] && sleep 20
+            done
+            echo "  - $1 respondeu $got (esperado $2)" >> /tmp/falhas
+            return 1
+          }
+
+          : > /tmp/falhas
+          probe "https://api.hextrack.com.br/health" 200 || true
+          probe "https://app.hextrack.com.br/login" 200 || true
+          probe "https://api.hextrack.com.br/r/campisos-meta" 302 || true
+
+          if [ -s /tmp/falhas ]; then
+            echo "estado=fora" >> "$GITHUB_OUTPUT"
+            { echo 'falhas<<EOF'; cat /tmp/falhas; echo EOF; } >> "$GITHUB_OUTPUT"
+            echo "### FORA DO AR"; cat /tmp/falhas
+          else
+            echo "estado=ok" >> "$GITHUB_OUTPUT"
+            echo "### Tudo respondendo"
+          fi
+
+      - name: Abrir alerta (issue) se estiver fora
+        if: steps.probe.outputs.estado == 'fora'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          abertas="$(gh issue list --label uptime-down --state open --json number -q 'length')"
+          if [ "$abertas" -gt 0 ]; then
+            echo "Já existe alerta aberto; não duplico."
+            exit 0
+          fi
+          gh issue create \
+            --title "HexTrack fora do ar — $(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')" \
+            --label uptime-down \
+            --body "$(printf 'A checagem externa nao conseguiu falar com o HexTrack.\n\nSondas que falharam:\n%s\n\nIsto vem de FORA da Hostinger, entao NAO e bloqueio do seu IP: o servico esta inacessivel para todo mundo.\n\nProximo passo sem SSH: aba Actions do repo hextrack, workflow Runbook de emergencia (VPS), acao diagnostico.\n\nEste alerta fecha sozinho quando o servico voltar.\n' "${{ steps.probe.outputs.falhas }}")"
+
+      - name: Fechar alerta se voltou
+        if: steps.probe.outputs.estado == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label uptime-down --state open --json number -q '.[].number'); do
+            gh issue comment "$n" --body "Serviço normalizado em $(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M'). Fechando."
+            gh issue close "$n"
+          done
+
+      - name: Heartbeat diário (mantém o agendamento vivo)
+        if: steps.probe.outputs.estado == 'ok'
+        run: |
+          # O GitHub desativa workflow agendado em repo sem atividade por 60 dias.
+          # Um commit por dia mantém o agendamento vivo e ainda serve de registro.
+          hoje="$(date -u +%Y-%m-%d)"
+          if ! grep -q "^$hoje" STATUS.md 2>/dev/null; then
+            printf '%s UTC — tudo respondendo\n' "$(date -u +'%Y-%m-%d %H:%M')" >> STATUS.md
+            tail -60 STATUS.md > /tmp/s && mv /tmp/s STATUS.md
+            git -c user.name='uptime-bot' -c user.email='info@hex8.ai' commit -qam "chore: heartbeat $hoje"
+            git push -q
+          fi
