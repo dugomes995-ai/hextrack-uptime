@@ -3,13 +3,37 @@ name: Checagem externa de uptime
 # Vigia o HexTrack DE FORA da Hostinger.
 #
 # Por que existe: o watchdog que roda dentro da VPS cobre "a VPS está viva mas o
-# HexTrack caiu" (o incidente de 04/08/2026). Ele não cobre a VPS inteira morrer —
+# HexTrack caiu" (o incidente de 04/08/2026). Ele não cobre a VPS inteira morrer,
 # aí ninguém roda o cron e o silêncio é total. Este workflow roda na infra do
 # GitHub, então sobrevive à VPS inteira sumir.
 #
 # Repo público de propósito: Actions em repo público tem minuto ilimitado, e este
 # workflow NÃO usa nenhum segredo. O alerta sai como issue, e o GitHub notifica o
 # dono por e-mail. Nada de credencial num repo aberto.
+#
+# ------------------------------------------------------------------
+# Por que existe filtro de alarme falso (adicionado em 10/08/2026)
+# ------------------------------------------------------------------
+# Entre 06 e 10/08/2026 este workflow abriu 16 alertas (issues #5 a #20) com
+# assinatura idêntica: 000 nas três sondas. Em todos, o serviço estava NO AR:
+# no alerta das 07:07 BRT de 10/08 o backend atendeu 251 requisições na mesma
+# janela, com usuário real navegando e webhook de WhatsApp entrando, e nenhum IP
+# externo apareceu no log. Na execução seguinte, que passou, o IP do runner
+# (52.161.177.66, Azure) aparece no log com 200.
+#
+# Causa: a borda da Hostinger blackhola faixas de IP do Azure/GitHub de forma
+# intermitente. Cada execução pega um runner com IP diferente, então às vezes cai
+# num IP já marcado e o pacote nunca chega na VPS.
+#
+# Pista de leitura: 000 nas três sondas ao mesmo tempo é rede, não aplicação.
+# App caída com Traefik de pé devolve 502/503. E app.hextrack (frontend) e
+# api.hextrack (backend) são containers separados, cair junto nos dois é a rota.
+#
+# Duas travas contra isso, o alerta só sai se as duas passarem:
+#   1. segunda opinião por outra rede antes de considerar queda;
+#   2. duas execuções seguidas falhando (cada execução = runner com IP diferente).
+# Custo: 10 a 20 min a mais para detectar queda real. Coberto pelo watchdog de
+# dentro da VPS, que pega falha de aplicação em segundos.
 
 on:
   schedule:
@@ -27,7 +51,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +59,7 @@ jobs:
         id: probe
         run: |
           set -uo pipefail
+
           probe() {  # url, http esperado
             for i in 1 2 3; do
               got="$(curl -s -o /tmp/body -w '%{http_code}' --max-time 15 "$1" || echo erro)"
@@ -50,17 +75,54 @@ jobs:
           probe "https://app.hextrack.com.br/login" 200 || true
           probe "https://api.hextrack.com.br/r/campisos-meta" 302 || true
 
-          if [ -s /tmp/falhas ]; then
-            echo "estado=fora" >> "$GITHUB_OUTPUT"
-            { echo 'falhas<<EOF'; cat /tmp/falhas; echo EOF; } >> "$GITHUB_OUTPUT"
-            echo "### FORA DO AR"; cat /tmp/falhas
-          else
+          if [ ! -s /tmp/falhas ]; then
             echo "estado=ok" >> "$GITHUB_OUTPUT"
             echo "### Tudo respondendo"
+            exit 0
           fi
 
+          echo "### Sondas diretas falharam"
+          cat /tmp/falhas
+
+          # Segunda opinião: mesmo alvo, rede de saída diferente do runner.
+          # O relay devolve 200 mesmo com upstream quebrado, então vale o CORPO,
+          # nunca o status.
+          relay=''
+          for i in 1 2; do
+            relay="$(curl -s --max-time 30 'https://r.jina.ai/https://api.hextrack.com.br/health' || true)"
+            case "$relay" in *'"status":"ok"'*) break ;; esac
+            [ "$i" -lt 2 ] && sleep 10
+          done
+
+          case "$relay" in
+            *'"status":"ok"'*)
+              echo "estado=bloqueio" >> "$GITHUB_OUTPUT"
+              echo "### Runner bloqueado na borda: serviço NO AR, confirmado por outra rede"
+              exit 0
+              ;;
+          esac
+
+          echo "### Segunda opinião também não alcançou"
+          echo "estado=fora" >> "$GITHUB_OUTPUT"
+          { echo 'falhas<<EOF'; cat /tmp/falhas; echo EOF; } >> "$GITHUB_OUTPUT"
+
+      - name: Contar falhas seguidas
+        id: contador
+        if: always()
+        run: |
+          set -uo pipefail
+          antes="$(cat state/falhas-seguidas 2>/dev/null || echo 0)"
+          case '${{ steps.probe.outputs.estado }}' in
+            fora) agora=$((antes + 1)) ;;
+            *)    agora=0 ;;
+          esac
+          mkdir -p state
+          echo "$agora" > state/falhas-seguidas
+          echo "seguidas=$agora" >> "$GITHUB_OUTPUT"
+          echo "Falhas seguidas: $antes -> $agora"
+
       - name: Abrir alerta (issue) se estiver fora
-        if: steps.probe.outputs.estado == 'fora'
+        if: steps.probe.outputs.estado == 'fora' && fromJSON(steps.contador.outputs.seguidas) >= 2
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -72,27 +134,53 @@ jobs:
           gh issue create \
             --title "HexTrack fora do ar — $(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')" \
             --label uptime-down \
-            --body "$(printf 'A checagem externa nao conseguiu falar com o HexTrack.\n\nSondas que falharam:\n%s\n\nIsto vem de FORA da Hostinger, entao NAO e bloqueio do seu IP: o servico esta inacessivel para todo mundo.\n\nProximo passo sem SSH: aba Actions do repo hextrack, workflow Runbook de emergencia (VPS), acao diagnostico.\n\nEste alerta fecha sozinho quando o servico voltar.\n' "${{ steps.probe.outputs.falhas }}")"
+            --body "$(printf 'A checagem externa nao conseguiu falar com o HexTrack.\n\nSondas que falharam:\n%s\n\nEste alerta ja passou pelos dois filtros de alarme falso:\n- uma segunda rota, por outra rede, tambem nao alcancou o servico;\n- %s execucoes seguidas falharam, cada uma de um runner com IP diferente.\n\nOu seja: NAO e bloqueio de IP na borda da Hostinger. O servico esta inacessivel para todo mundo.\n\nProximo passo sem SSH: aba Actions do repo hextrack, workflow Runbook de emergencia (VPS), acao diagnostico.\n\nEste alerta fecha sozinho quando o servico voltar.\n' "${{ steps.probe.outputs.falhas }}" "${{ steps.contador.outputs.seguidas }}")"
 
       - name: Fechar alerta se voltou
-        if: steps.probe.outputs.estado == 'ok'
+        if: steps.probe.outputs.estado == 'ok' || steps.probe.outputs.estado == 'bloqueio'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ '${{ steps.probe.outputs.estado }}' = 'bloqueio' ]; then
+            nota="Servico confirmado NO AR por segunda rota (a sonda direta deste runner foi bloqueada na borda da Hostinger). Fechando."
+          else
+            nota="Servico normalizado em $(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M'). Fechando."
+          fi
           for n in $(gh issue list --label uptime-down --state open --json number -q '.[].number'); do
-            gh issue comment "$n" --body "Serviço normalizado em $(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M'). Fechando."
+            gh issue comment "$n" --body "$nota"
             gh issue close "$n"
           done
 
-      - name: Heartbeat diário (mantém o agendamento vivo)
-        if: steps.probe.outputs.estado == 'ok'
+      - name: Registrar estado (mantém o agendamento vivo)
+        if: always()
         run: |
-          # O GitHub desativa workflow agendado em repo sem atividade por 60 dias.
-          # Um commit por dia mantém o agendamento vivo e ainda serve de registro.
+          set -uo pipefail
+          estado='${{ steps.probe.outputs.estado }}'
+          agora="$(date -u +'%Y-%m-%d %H:%M')"
           hoje="$(date -u +%Y-%m-%d)"
-          if ! grep -q "^$hoje" STATUS.md 2>/dev/null; then
-            printf '%s UTC — tudo respondendo\n' "$(date -u +'%Y-%m-%d %H:%M')" >> STATUS.md
+
+          linha=''
+          case "$estado" in
+            ok)
+              # O GitHub desativa workflow agendado em repo sem atividade por 60
+              # dias. Uma linha por dia mantém o agendamento vivo e serve de registro.
+              grep -q "^$hoje" STATUS.md 2>/dev/null || linha="$agora UTC: tudo respondendo"
+              ;;
+            bloqueio)
+              linha="$agora UTC: runner bloqueado na borda da Hostinger, servico confirmado NO AR por outra rede"
+              ;;
+            fora)
+              linha="$agora UTC: sem resposta por duas rotas (falhas seguidas: ${{ steps.contador.outputs.seguidas }})"
+              ;;
+          esac
+
+          if [ -n "$linha" ]; then
+            printf '%s\n' "$linha" >> STATUS.md
             tail -60 STATUS.md > /tmp/s && mv /tmp/s STATUS.md
-            git -c user.name='uptime-bot' -c user.email='info@hex8.ai' commit -qam "chore: heartbeat $hoje"
-            git push -q
           fi
+
+          git add STATUS.md state 2>/dev/null || true
+          git diff --cached --quiet && { echo "Nada a registrar."; exit 0; }
+          git -c user.name='uptime-bot' -c user.email='info@hex8.ai' commit -qm "chore: $estado $agora"
+          git pull --rebase -q
+          git push -q
