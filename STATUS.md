@@ -1,4 +1,3 @@
-2026-08-25 05:06 UTC: runner bloqueado na borda da Hostinger, servico confirmado NO AR por outra rede
 2026-08-25 07:06 UTC: runner bloqueado na borda da Hostinger, servico confirmado NO AR por outra rede
 2026-08-25 16:53 UTC: runner bloqueado na borda da Hostinger, servico confirmado NO AR por outra rede
 2026-08-25 19:01 UTC: runner bloqueado na borda da Hostinger, servico confirmado NO AR por outra rede
@@ -58,3 +57,4 @@
 2026-10-03 02:07 UTC: tudo respondendo
 2026-10-04 01:48 UTC: tudo respondendo
 2026-10-05 02:08 UTC: tudo respondendo
+2026-10-05 08:58 UTC: runner bloqueado na borda da Hostinger, servico confirmado NO AR por outra rede
